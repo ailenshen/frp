@@ -229,10 +229,10 @@ func (p *MCPStdioPlugin) worker() {
 		}
 	}
 
-	// readResponse reads lines until it finds one whose JSON-RPC id matches
-	// reqID, discarding any server notifications/progress received in between.
-	// A single deadline is shared across iterations so chatty servers cannot
-	// extend the timeout by sending many notifications.
+	// readResponse reads lines until it finds the response whose JSON-RPC id
+	// matches reqID, discarding server notifications/progress and refusing
+	// server-to-client requests in between. A single deadline is shared across
+	// iterations so chatty servers cannot extend the timeout.
 	readResponse := func(out *bufio.Reader, reqID string) ([]byte, error) {
 		deadline := time.After(mcpStdioReadTimeout)
 		for {
@@ -248,12 +248,30 @@ func (p *MCPStdioPlugin) worker() {
 				}
 				line := bytes.TrimRight(r.line, "\r\n")
 				var head struct {
-					ID json.RawMessage `json:"id"`
+					ID     json.RawMessage `json:"id"`
+					Method string          `json:"method"`
 				}
-				if err := json.Unmarshal(line, &head); err != nil || string(head.ID) == reqID {
+				if err := json.Unmarshal(line, &head); err != nil {
 					return line, nil
 				}
-				// server notification/progress; discard and read next line
+				if head.Method == "" && string(head.ID) == reqID {
+					return line, nil
+				}
+				if head.Method != "" && len(head.ID) > 0 && string(head.ID) != "null" {
+					// A server-to-client request (e.g. roots/list) has no way back over
+					// one-shot HTTP, and servers such as server-filesystem stall every
+					// request until it is answered. Refuse it so the server falls back.
+					// Refactor: forward it instead once mcp_stdio can relay server requests
+					// to the HTTP client (e.g. over an SSE stream).
+					reply, err := refuseServerRequest(head.ID, head.Method)
+					if err != nil {
+						return nil, err
+					}
+					if _, err := fmt.Fprintf(childIn, "%s\n", reply); err != nil {
+						return nil, fmt.Errorf("refuse server request: %w", err)
+					}
+				}
+				// otherwise a server notification/progress; discard and read next line
 			case <-deadline:
 				return nil, errors.New("child response timeout")
 			case <-p.closeCh:
@@ -444,6 +462,19 @@ func classifyJSONRPC(body []byte) (hasID bool, reqID string, isInit, isInitNote 
 	isInit = head.Method == "initialize"
 	isInitNote = head.Method == "notifications/initialized"
 	return
+}
+
+// refuseServerRequest builds the JSON-RPC "method not found" error sent back
+// to the child for a server-to-client request the bridge cannot deliver.
+func refuseServerRequest(id json.RawMessage, method string) ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error": map[string]any{
+			"code":    -32601,
+			"message": method + " is not supported by the mcp_stdio bridge",
+		},
+	})
 }
 
 // withReplacedID returns a copy of a JSON-RPC response line with its "id"

@@ -119,6 +119,67 @@ func TestMCPStdioDispatchAndReplay(t *testing.T) {
 	require.Contains(t, string(resp), `"call=3"`)
 }
 
+// rootsMCPScript behaves like server-filesystem with a roots-capable client:
+// after "notifications/initialized" it asks the client for roots/list (id 0)
+// and holds back every response until that request is answered.
+const rootsMCPScript = `pending=0; deferred=
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"notifications/initialized"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"roots/list"}'
+      pending=1
+      ;;
+    *'"error"'*)
+      pending=0
+      if [ -n "$deferred" ]; then
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"result\":\"ok\",\"id\":${deferred}}"
+        deferred=
+      fi
+      ;;
+    *'"id"'*)
+      id=$(printf '%s' "$line" | grep -o '"id":[^,}]*' | sed 's/"id"://')
+      if [ "$pending" = 1 ]; then
+        deferred=$id
+      else
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"result\":\"ok\",\"id\":${id}}"
+      fi
+      ;;
+  esac
+done
+`
+
+func TestMCPStdioRefusesServerRequests(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh stub")
+	}
+
+	dir := t.TempDir()
+	scriptPath := dir + "/roots.sh"
+	require.NoError(t, os.WriteFile(scriptPath, []byte(rootsMCPScript), 0o600))
+
+	plugin, err := NewMCPStdioPlugin(PluginContext{}, &v1.MCPStdioPluginOptions{
+		Type:    v1.PluginMCPStdio,
+		Command: []string{"/bin/sh", scriptPath},
+	})
+	require.NoError(t, err)
+	defer plugin.Close()
+
+	p := plugin.(*MCPStdioPlugin)
+	ctx := context.Background()
+
+	_, err = p.dispatch(ctx, []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	require.NoError(t, err)
+	_, err = p.dispatch(ctx, []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+	require.NoError(t, err)
+
+	// The client request reuses id 0, the same id as the child's roots/list:
+	// the bridge must not mistake that request for the response, must answer
+	// it so the child unblocks, and must then return the real response.
+	resp, err := p.dispatch(ctx, []byte(`{"jsonrpc":"2.0","id":0,"method":"tools/list"}`))
+	require.NoError(t, err)
+	require.JSONEq(t, `{"jsonrpc":"2.0","result":"ok","id":0}`, string(resp))
+}
+
 func TestMCPStdioHTTPHandler(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses /bin/sh stub")
