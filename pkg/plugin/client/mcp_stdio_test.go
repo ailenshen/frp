@@ -218,6 +218,152 @@ func TestMCPStdioTimeoutRepliesWithJSONRPCError(t *testing.T) {
 	require.Equal(t, mcpStdioTimeoutCode, got.Error.Code)
 }
 
+// concurrentMCPScript answers "slow" after 0.3s in the background, never
+// answers "never", exits on "die", answers a notifications/cancelled by
+// resolving the cancelled request, and answers anything else at once with its
+// line count (which restarts at 1 in a respawned child).
+const concurrentMCPScript = `n=0
+while IFS= read -r line; do
+  n=$((n+1))
+  id=$(printf '%s' "$line" | grep -o '"id":[^,}]*' | head -1 | sed 's/"id"://')
+  case "$line" in
+    *'"method":"notifications/cancelled"'*)
+      rid=$(printf '%s' "$line" | grep -o '"requestId":[^,}]*' | sed 's/"requestId"://')
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"result\":\"cancelled\",\"id\":${rid}}"
+      ;;
+    *'"method":"slow"'*)
+      ( sleep 0.3; printf '%s\n' "{\"jsonrpc\":\"2.0\",\"result\":\"slow\",\"id\":${id}}" ) &
+      ;;
+    *'"method":"never"'*) ;;
+    *'"method":"die"'*) exit 0 ;;
+    *)
+      if [ -n "$id" ]; then
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"result\":\"call=${n}\",\"id\":${id}}"
+      fi
+      ;;
+  esac
+done
+`
+
+func newConcurrentTestPlugin(t *testing.T) *MCPStdioPlugin {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh stub")
+	}
+	scriptPath := t.TempDir() + "/concurrent.sh"
+	require.NoError(t, os.WriteFile(scriptPath, []byte(concurrentMCPScript), 0o600))
+	plugin, err := NewMCPStdioPlugin(PluginContext{}, &v1.MCPStdioPluginOptions{
+		Type:    v1.PluginMCPStdio,
+		Command: []string{"/bin/sh", scriptPath},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = plugin.Close() })
+	return plugin.(*MCPStdioPlugin)
+}
+
+type testRPCResponse struct {
+	ID     int    `json:"id"`
+	Result string `json:"result"`
+	Error  struct {
+		Code int `json:"code"`
+	} `json:"error"`
+}
+
+func dispatchAsync(p *MCPStdioPlugin, body string) <-chan testRPCResponse {
+	ch := make(chan testRPCResponse, 1)
+	go func() {
+		var r testRPCResponse
+		if resp, err := p.dispatch(context.Background(), []byte(body)); err == nil {
+			_ = json.Unmarshal(resp, &r)
+		}
+		ch <- r
+	}()
+	return ch
+}
+
+func TestMCPStdioConcurrentRequestsShareIDs(t *testing.T) {
+	p := newConcurrentTestPlugin(t)
+
+	// Two callers both use id 1. The fast call must not wait behind the slow
+	// one, and each caller must get its own answer under its own id.
+	slow := dispatchAsync(p, `{"jsonrpc":"2.0","id":1,"method":"slow"}`)
+	time.Sleep(50 * time.Millisecond)
+	fast := dispatchAsync(p, `{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+
+	select {
+	case r := <-fast:
+		require.Equal(t, 1, r.ID)
+		require.Equal(t, "call=2", r.Result)
+	case <-slow:
+		t.Fatal("slow call answered before the fast one")
+	}
+	r := <-slow
+	require.Equal(t, 1, r.ID)
+	require.Equal(t, "slow", r.Result)
+}
+
+func TestMCPStdioTimeoutKeepsResponsiveChild(t *testing.T) {
+	saved := mcpStdioReadTimeout
+	mcpStdioReadTimeout = 300 * time.Millisecond
+	defer func() { mcpStdioReadTimeout = saved }()
+	p := newConcurrentTestPlugin(t)
+
+	never := dispatchAsync(p, `{"jsonrpc":"2.0","id":9,"method":"never"}`)
+	// Keep the child talking while "never" waits out its timeout.
+	for i := 0; i < 5; i++ {
+		time.Sleep(100 * time.Millisecond)
+		r := <-dispatchAsync(p, `{"jsonrpc":"2.0","id":2,"method":"ping"}`)
+		require.NotEmpty(t, r.Result)
+	}
+	r := <-never
+	require.Equal(t, 9, r.ID)
+	require.Equal(t, mcpStdioTimeoutCode, r.Error.Code)
+
+	// Same child: the line count keeps going (the bridge's cancellation of
+	// "never" counts as a line too) instead of restarting at 1.
+	r = <-dispatchAsync(p, `{"jsonrpc":"2.0","id":3,"method":"ping"}`)
+	require.NotEqual(t, "call=1", r.Result)
+	require.NotEmpty(t, r.Result)
+}
+
+func TestMCPStdioChildExitFailsFastAndRespawns(t *testing.T) {
+	p := newConcurrentTestPlugin(t)
+
+	start := time.Now()
+	r := <-dispatchAsync(p, `{"jsonrpc":"2.0","id":4,"method":"die"}`)
+	require.Equal(t, 4, r.ID)
+	require.Equal(t, mcpStdioClosedCode, r.Error.Code)
+	require.Less(t, time.Since(start), 5*time.Second, "an exited child must not wait out the timeout")
+
+	r = <-dispatchAsync(p, `{"jsonrpc":"2.0","id":5,"method":"ping"}`)
+	require.Equal(t, 5, r.ID)
+	require.Equal(t, "call=1", r.Result)
+}
+
+func TestMCPStdioCancelledNotificationMapsID(t *testing.T) {
+	p := newConcurrentTestPlugin(t)
+
+	// Use up a few bridge ids so the client's id differs from the bridge's.
+	for i := 0; i < 3; i++ {
+		<-dispatchAsync(p, `{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	}
+	never := dispatchAsync(p, `{"jsonrpc":"2.0","id":1,"method":"never"}`)
+	time.Sleep(50 * time.Millisecond)
+	_, err := p.dispatch(context.Background(),
+		[]byte(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}`))
+	require.NoError(t, err)
+
+	// The fake resolves whatever requestId it was told to cancel; it only
+	// reaches the "never" caller if the bridge mapped the id.
+	select {
+	case r := <-never:
+		require.Equal(t, 1, r.ID)
+		require.Equal(t, "cancelled", r.Result)
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation did not reach the child under the bridge id")
+	}
+}
+
 func TestMCPStdioHTTPHandler(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses /bin/sh stub")
