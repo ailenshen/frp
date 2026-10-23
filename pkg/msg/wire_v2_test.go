@@ -43,7 +43,26 @@ func TestV2ReadWriterRoundTrip(t *testing.T) {
 func TestNewReadWriter(t *testing.T) {
 	require.IsType(t, &V1ReadWriter{}, NewReadWriter(&bytes.Buffer{}, ""))
 	require.IsType(t, &V1ReadWriter{}, NewReadWriter(&bytes.Buffer{}, wire.ProtocolV1))
+	require.IsType(t, &V1ReadWriter{}, NewReadWriter(&bytes.Buffer{}, "unknown"))
 	require.IsType(t, &V2ReadWriter{}, NewReadWriter(&bytes.Buffer{}, wire.ProtocolV2))
+}
+
+func TestNewReadWriterEncoding(t *testing.T) {
+	for _, wireProtocol := range []string{"", wire.ProtocolV1} {
+		var legacy bytes.Buffer
+		legacyRW := NewReadWriter(&legacy, wireProtocol)
+		require.NoError(t, legacyRW.WriteMsg(&UDPPacket{Content: []byte("legacy")}))
+		require.NotEmpty(t, legacy.Bytes())
+		require.Equal(t, TypeUDPPacket, legacy.Bytes()[0])
+	}
+
+	var v2 bytes.Buffer
+	v2RW := NewReadWriter(&v2, wire.ProtocolV2)
+	require.NoError(t, v2RW.WriteMsg(&UDPPacket{Content: []byte("v2")}))
+	frame, err := wire.NewConn(&v2).ReadFrame()
+	require.NoError(t, err)
+	require.Equal(t, wire.FrameTypeMessage, frame.Type)
+	require.Equal(t, V2TypeUDPPacket, binary.BigEndian.Uint16(frame.Payload[:2]))
 }
 
 func TestV2MessageTypeIDsAreStable(t *testing.T) {
@@ -65,6 +84,9 @@ func TestV2MessageTypeIDsAreStable(t *testing.T) {
 	require.Equal(t, uint16(16), V2TypeNatHoleResp)
 	require.Equal(t, uint16(17), V2TypeNatHoleSid)
 	require.Equal(t, uint16(18), V2TypeNatHoleReport)
+	require.Equal(t, uint16(19), V2TypeUDPPacketBinary)
+	_, registered := v2MsgTypeMap[V2TypeUDPPacketBinary]
+	require.False(t, registered, "binary UDP has a dedicated codec and must not alter generic type registry")
 }
 
 func TestV2MessageFrameEncoding(t *testing.T) {

@@ -38,6 +38,7 @@ func (v *ConfigValidator) ValidateClientCommonConfig(c *v1.ClientCommonConfig) (
 		func() (Warning, error) { return v.validateAuthConfig(&c.Auth) },
 		func() (Warning, error) { return nil, validateLogConfig(&c.Log) },
 		func() (Warning, error) { return nil, validateWebServerConfig(&c.WebServer) },
+		func() (Warning, error) { return nil, validateMetricsServerConfig(&c.MetricsServer, &c.WebServer) },
 		func() (Warning, error) { return validateTransportConfig(&c.Transport) },
 		func() (Warning, error) { return validateIncludeFiles(c.IncludeConfigFiles) },
 	}
@@ -51,12 +52,49 @@ func (v *ConfigValidator) ValidateClientCommonConfig(c *v1.ClientCommonConfig) (
 }
 
 func validateFeatureGates(c *v1.ClientCommonConfig) (Warning, error) {
+	gates := featuregate.NewFeatureGate()
+	if err := gates.SetFromMap(c.FeatureGates); err != nil {
+		return nil, err
+	}
+
 	if c.VirtualNet.Address != "" {
-		if !featuregate.Enabled(featuregate.VirtualNet) {
+		if !gates.Enabled(featuregate.VirtualNet) {
 			return nil, fmt.Errorf("VirtualNet feature is not enabled; enable it by setting the appropriate feature gate flag")
 		}
 	}
 	return nil, nil
+}
+
+// ClientConfigRequirements describes runtime capabilities needed by a client configuration.
+type ClientConfigRequirements struct {
+	VirtualNet bool
+}
+
+// GetClientConfigRequirements returns the runtime capabilities needed by a client configuration.
+func GetClientConfigRequirements(
+	common *v1.ClientCommonConfig,
+	proxyCfgs []v1.ProxyConfigurer,
+	visitorCfgs []v1.VisitorConfigurer,
+) ClientConfigRequirements {
+	requirements := ClientConfigRequirements{}
+	if common != nil && common.VirtualNet.Address != "" {
+		requirements.VirtualNet = true
+	}
+	for _, cfg := range proxyCfgs {
+		if cfg.GetBaseConfig().Plugin.Type == v1.PluginVirtualNet {
+			requirements.VirtualNet = true
+			break
+		}
+	}
+	if !requirements.VirtualNet {
+		for _, cfg := range visitorCfgs {
+			if cfg.GetBaseConfig().Plugin.Type == v1.VisitorPluginVirtualNet {
+				requirements.VirtualNet = true
+				break
+			}
+		}
+	}
+	return requirements
 }
 
 func (v *ConfigValidator) validateAuthConfig(c *v1.AuthClientConfig) (Warning, error) {
@@ -126,6 +164,10 @@ func validateTransportConfig(c *v1.ClientTransportConfig) (Warning, error) {
 		warnings = AppendError(warnings, checkTLSConfig("transport.tls.certFile", c.TLS.CertFile))
 		warnings = AppendError(warnings, checkTLSConfig("transport.tls.keyFile", c.TLS.KeyFile))
 		warnings = AppendError(warnings, checkTLSConfig("transport.tls.trustedCaFile", c.TLS.TrustedCaFile))
+		// wss keeps TLS on regardless of transport.tls.enable.
+		if c.TLS.UseSystemCa && c.Protocol != "wss" {
+			errs = AppendError(errs, fmt.Errorf("transport.tls.useSystemCa requires transport.tls.enable to be true unless transport.protocol is wss"))
+		}
 	}
 
 	if !slices.Contains(SupportedTransportProtocols, c.Protocol) {

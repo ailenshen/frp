@@ -65,7 +65,12 @@ func (vm *Manager) Listen(name string, sk string, allowUsers []string) (*netpkg.
 
 func (vm *Manager) NewConn(name string, conn net.Conn, timestamp int64, signKey string,
 	useEncryption bool, useCompression bool, visitorUser string,
+	wireProtocol string, udpPacketCodecs ...string,
 ) (err error) {
+	udpPacketCodec := ""
+	if len(udpPacketCodecs) > 0 {
+		udpPacketCodec = udpPacketCodecs[0]
+	}
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
 
@@ -90,12 +95,31 @@ func (vm *Manager) NewConn(name string, conn net.Conn, timestamp int64, signKey 
 		if useCompression {
 			rwc = libio.WithCompression(rwc)
 		}
-		err = l.l.PutConn(netpkg.WrapReadWriteCloserToConn(rwc, conn))
+		visitorConn := netpkg.WrapReadWriteCloserToConn(rwc, conn)
+		err = l.l.PutConn(&wireProtocolConn{
+			Conn:           visitorConn,
+			wireProtocol:   wireProtocol,
+			udpPacketCodec: udpPacketCodec,
+		})
 	} else {
 		err = fmt.Errorf("custom listener for [%s] doesn't exist", name)
 		return
 	}
 	return
+}
+
+type wireProtocolConn struct {
+	net.Conn
+	wireProtocol   string
+	udpPacketCodec string
+}
+
+func (c *wireProtocolConn) WireProtocol() string {
+	return c.wireProtocol
+}
+
+func (c *wireProtocolConn) UDPPacketCodec() string {
+	return c.udpPacketCodec
 }
 
 func (vm *Manager) CloseListener(name string) {

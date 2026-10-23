@@ -28,8 +28,6 @@ import (
 
 	libio "github.com/fatedier/golib/io"
 	"github.com/fatedier/golib/pool"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 
 	httppkg "github.com/fatedier/frp/pkg/util/http"
 	"github.com/fatedier/frp/pkg/util/log"
@@ -139,7 +137,7 @@ func NewHTTPReverseProxy(option HTTPReverseProxyOptions, vhostRouter *Routers) *
 			_, _ = rw.Write(getNotFoundPageContent())
 		},
 	}
-	rp.proxy = h2c.NewHandler(proxy, &http2.Server{})
+	rp.proxy = proxy
 	return rp
 }
 
@@ -208,13 +206,29 @@ func checkRouteAuthByRequest(req *http.Request, rc *RouteConfig) bool {
 }
 
 func (rp *HTTPReverseProxy) connectHandler(rw http.ResponseWriter, req *http.Request) {
+	if req.ContentLength > 0 || len(req.TransferEncoding) > 0 {
+		http.Error(rw, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
 	hj, ok := rw.(http.Hijacker)
 	if !ok {
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	client, _, err := hj.Hijack()
+	// Forward only CONNECT headers; the original Body must not be used after Hijack.
+	outreq := req.Clone(req.Context())
+	outreq.Body = nil
+	outreq.GetBody = nil
+	outreq.ContentLength = 0
+	outreq.TransferEncoding = nil
+	outreq.Trailer = nil
+	outreq.Header.Del("Content-Length")
+	outreq.Header.Del("Transfer-Encoding")
+	outreq.Header.Del("Trailer")
+
+	client, buffered, err := hj.Hijack()
 	if err != nil {
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
@@ -226,8 +240,12 @@ func (rp *HTTPReverseProxy) connectHandler(rw http.ResponseWriter, req *http.Req
 		client.Close()
 		return
 	}
-	_ = req.Write(remote)
-	go libio.Join(remote, client)
+	if err := outreq.Write(remote); err != nil {
+		_ = remote.Close()
+		_ = client.Close()
+		return
+	}
+	go libio.Join(remote, libio.WrapReadWriteCloser(buffered.Reader, client, client.Close))
 }
 
 func getRequestRouteUser(req *http.Request) string {

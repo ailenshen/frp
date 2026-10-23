@@ -44,6 +44,12 @@ func (v *ConfigValidator) ValidateServerConfig(c *v1.ServerConfig) (Warning, err
 	if err := validateWebServerConfig(&c.WebServer); err != nil {
 		errs = AppendError(errs, err)
 	}
+	if err := validateMetricsServerConfig(&c.MetricsServer, &c.WebServer); err != nil {
+		errs = AppendError(errs, err)
+	}
+	if c.Transport.TLS.UseSystemCa {
+		errs = AppendError(errs, fmt.Errorf("transport.tls.useSystemCa is only supported in frpc transport.tls"))
+	}
 
 	errs = AppendError(errs, ValidatePort(c.BindPort, "bindPort"))
 	errs = AppendError(errs, ValidatePort(c.KCPBindPort, "kcpBindPort"))
@@ -51,6 +57,9 @@ func (v *ConfigValidator) ValidateServerConfig(c *v1.ServerConfig) (Warning, err
 	errs = AppendError(errs, ValidatePort(c.VhostHTTPPort, "vhostHTTPPort"))
 	errs = AppendError(errs, ValidatePort(c.VhostHTTPSPort, "vhostHTTPSPort"))
 	errs = AppendError(errs, ValidatePort(c.TCPMuxHTTPConnectPort, "tcpMuxHTTPConnectPort"))
+	if c.Transport.MaxPoolCount < 0 {
+		errs = AppendError(errs, fmt.Errorf("invalid transport.maxPoolCount, must be non-negative"))
+	}
 
 	for _, p := range c.HTTPPlugins {
 		if !lo.Every(SupportedHTTPPluginOps, p.Ops) {

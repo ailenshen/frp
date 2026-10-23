@@ -1,24 +1,26 @@
-version: 2
+version: 2.1
 jobs:
   go-version-latest:
     docker:
-    - image: cimg/go:1.25-node
+    - image: cimg/go:1.26-node
     resource_class: large
     steps:
     - checkout
     - run:
-        name: Build web assets (frps)
-        command: make install build
-        working_directory: web/frps
+        name: Test and build web assets
+        command: make web-ci
     - run:
-        name: Build web assets (frpc)
-        command: make install build
-        working_directory: web/frpc
-    - run: make
-    - run: make alltest
+        name: Check Go formatting and build binaries
+        command: |
+          set -e
+          make env fmt
+          git diff --exit-code
+          make build
+    - run:
+        name: Run all tests
+        command: make alltest
 
 workflows:
-  version: 2
   build_and_test:
     jobs:
     - go-version-latest

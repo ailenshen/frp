@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatedier/golib/crypto"
@@ -32,6 +33,8 @@ import (
 	"github.com/fatedier/frp/pkg/config"
 	"github.com/fatedier/frp/pkg/config/source"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/config/v1/validation"
+	"github.com/fatedier/frp/pkg/metrics/text"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/policy/security"
 	httppkg "github.com/fatedier/frp/pkg/util/http"
@@ -109,6 +112,9 @@ func setServiceOptionsDefault(options *ServiceOptions) error {
 // Service is the client service that connects to frps and provides proxy services.
 type Service struct {
 	ctlMu sync.RWMutex
+	// Stores gracefulShutdownDuration independently from ctlMu, because the
+	// graceful shutdown wait may hold ctlMu for an arbitrary duration.
+	gracefulShutdownDuration atomic.Int64
 	// manager control connection with server
 	ctl *Control
 	// Uniq id got from frps, it will be attached to loginMsg.
@@ -118,13 +124,14 @@ type Service struct {
 	auth *auth.ClientAuth
 
 	// web server for admin UI and apis
-	webServer *httppkg.Server
+	webServer     *httppkg.Server
+	metricsServer *httppkg.Server
 
 	vnetController *vnet.Controller
 
 	cfgMu sync.RWMutex
-	// reloadMu serializes reload transactions to keep reloadCommon and applied
-	// config in sync across concurrent API operations.
+	// reloadMu serializes config updates with control startup and publication,
+	// keeping reloadCommon and applied config in sync across reloads and reconnects.
 	reloadMu sync.Mutex
 	common   *v1.ClientCommonConfig
 	// reloadCommon is used for filtering/defaulting during config-source reloads.
@@ -149,8 +156,10 @@ type Service struct {
 	// service context
 	ctx context.Context
 	// call cancel to stop service
-	cancel                   context.CancelCauseFunc
-	gracefulShutdownDuration time.Duration
+	cancel context.CancelCauseFunc
+	// Protect cancel publication and shutdown before the first Run.
+	lifecycleMu sync.Mutex
+	closed      bool
 
 	connectorCreator func(context.Context, *v1.ClientCommonConfig) Connector
 	handleWorkConnCb func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool
@@ -181,8 +190,8 @@ func NewService(options ServiceOptions) (*Service, error) {
 	proxyCfgs = config.CompleteProxyConfigurers(proxyCfgs)
 	visitorCfgs = config.CompleteVisitorConfigurers(visitorCfgs)
 
-	// Create the web server after all fallible steps so its listener is not
-	// leaked when an earlier error causes NewService to return.
+	// Create HTTP servers after all other fallible steps, rolling back the web
+	// listener if the metrics server cannot be created.
 	var webServer *httppkg.Server
 	if options.Common.WebServer.Port > 0 {
 		ws, err := httppkg.NewServer(options.Common.WebServer)
@@ -191,11 +200,27 @@ func NewService(options ServiceOptions) (*Service, error) {
 		}
 		webServer = ws
 	}
+	// frpc exposes Go runtime metrics only. They are written by pkg/metrics/text
+	// so that client_golang and protobuf stay out of the frpc binary.
+	var metricsHandler http.Handler
+	if options.Common.MetricsServer.Port > 0 {
+		registry := text.NewRegistry()
+		registry.RegisterRuntime()
+		metricsHandler = registry.Handler()
+	}
+	metricsServer, err := httppkg.NewMetricsServer(options.Common.MetricsServer, metricsHandler)
+	if err != nil {
+		if webServer != nil {
+			_ = webServer.Close()
+		}
+		return nil, err
+	}
 
 	s := &Service{
 		ctx:              context.Background(),
 		auth:             authRuntime,
 		webServer:        webServer,
+		metricsServer:    metricsServer,
 		common:           options.Common,
 		reloadCommon:     options.Common,
 		configFilePath:   options.ConfigFilePath,
@@ -221,8 +246,20 @@ func NewService(options ServiceOptions) (*Service, error) {
 
 func (svr *Service) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancelCause(ctx)
+	svr.lifecycleMu.Lock()
+	if svr.closed {
+		svr.lifecycleMu.Unlock()
+		cancel(nil)
+		return ctx.Err()
+	}
 	svr.ctx = xlog.NewContext(ctx, xlog.FromContextSafe(ctx))
 	svr.cancel = cancel
+	svr.lifecycleMu.Unlock()
+	defer cancel(nil)
+	defer svr.stop()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// set custom DNSServer
 	if svr.common.DNSServer != "" {
@@ -233,7 +270,6 @@ func (svr *Service) Run(ctx context.Context) error {
 		vnetController := svr.vnetController
 		if err := svr.vnetController.Init(); err != nil {
 			log.Errorf("init virtual network controller error: %v", err)
-			svr.stop()
 			return err
 		}
 		go func() {
@@ -245,6 +281,12 @@ func (svr *Service) Run(ctx context.Context) error {
 	}
 
 	if svr.webServer != nil {
+		if svr.common.WebServer.PprofEnable {
+			log.Warnf("webServer pprof endpoints are deprecated; use metricsServer.pprofEnable instead")
+		}
+		if svr.common.MetricsServer.Port == 0 {
+			log.Infof("webServer /healthz is deprecated; health probes can migrate to metricsServer.port")
+		}
 		webServer := svr.webServer
 		go func() {
 			log.Infof("admin server listen on %s", webServer.Address())
@@ -254,24 +296,40 @@ func (svr *Service) Run(ctx context.Context) error {
 		}()
 	}
 
+	if svr.metricsServer != nil {
+		metricsServer := svr.metricsServer
+		go func() {
+			log.Infof("metrics server listen on %s", metricsServer.Address())
+			if err := metricsServer.Run(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Warnf("metrics server exit with error: %v", err)
+			}
+		}()
+	}
+
 	// first login to frps
 	svr.loopLoginUntilSuccess(10*time.Second, lo.FromPtr(svr.common.LoginFailExit))
 	if svr.ctl == nil {
 		cancelCause := cancelErr{}
 		_ = errors.As(context.Cause(svr.ctx), &cancelCause)
-		svr.stop()
 		return fmt.Errorf("login to the server failed: %v. With loginFailExit enabled, no additional retries will be attempted", cancelCause.Err)
 	}
 
 	go svr.keepControllerWorking()
 
 	<-svr.ctx.Done()
-	svr.stop()
 	return nil
 }
 
 func (svr *Service) keepControllerWorking() {
-	<-svr.ctl.Done()
+	// ctl is swapped under ctlMu in loopLoginUntilSuccess / stop; take a
+	// snapshot before waiting so stop's nil write does not race this read.
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+	if ctl == nil {
+		return
+	}
+	<-ctl.Done()
 
 	// There is a situation where the login is successful but due to certain reasons,
 	// the control immediately exits. It is necessary to limit the frequency of reconnection in this case.
@@ -281,8 +339,11 @@ func (svr *Service) keepControllerWorking() {
 		// loopLoginUntilSuccess is another layer of loop that will continuously attempt to
 		// login to the server until successful.
 		svr.loopLoginUntilSuccess(20*time.Second, false)
-		if svr.ctl != nil {
-			<-svr.ctl.Done()
+		svr.ctlMu.RLock()
+		ctl := svr.ctl
+		svr.ctlMu.RUnlock()
+		if ctl != nil {
+			<-ctl.Done()
 			return false, errors.New("control is closed and try another loop")
 		}
 		// If the control is nil, it means that the login failed and the service is also closed.
@@ -327,11 +388,6 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 		xl.AddPrefix(xlog.LogPrefix{Name: "runID", Value: svr.runID})
 		xl.Infof("login to server success, get run id [%s]", svr.runID)
 
-		svr.cfgMu.RLock()
-		proxyCfgs := svr.proxyCfgs
-		visitorCfgs := svr.visitorCfgs
-		svr.cfgMu.RUnlock()
-
 		ctl, err := NewControl(svr.ctx, sessionCtx)
 		if err != nil {
 			sessionCtx.Conn.Close()
@@ -340,6 +396,15 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 			return false, err
 		}
 		ctl.SetInWorkConnCallback(svr.handleWorkConnCb)
+
+		// An update must either precede this snapshot or apply to the published
+		// control. Keep dialing and login outside the reload transaction.
+		svr.reloadMu.Lock()
+		defer svr.reloadMu.Unlock()
+		svr.cfgMu.RLock()
+		proxyCfgs := svr.proxyCfgs
+		visitorCfgs := svr.visitorCfgs
+		svr.cfgMu.RUnlock()
 
 		ctl.Run(proxyCfgs, visitorCfgs)
 		// close and replace previous control
@@ -363,6 +428,13 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 }
 
 func (svr *Service) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) error {
+	svr.reloadMu.Lock()
+	defer svr.reloadMu.Unlock()
+	return svr.updateAllConfigurerLocked(proxyCfgs, visitorCfgs)
+}
+
+// Caller must hold reloadMu.
+func (svr *Service) updateAllConfigurerLocked(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) error {
 	svr.cfgMu.Lock()
 	svr.proxyCfgs = proxyCfgs
 	svr.visitorCfgs = visitorCfgs
@@ -373,7 +445,7 @@ func (svr *Service) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorC
 	svr.ctlMu.RUnlock()
 
 	if ctl != nil {
-		return svr.ctl.UpdateAllConfigurer(proxyCfgs, visitorCfgs)
+		return ctl.UpdateAllConfigurer(proxyCfgs, visitorCfgs)
 	}
 	return nil
 }
@@ -386,6 +458,15 @@ func (svr *Service) UpdateConfigSource(
 	svr.reloadMu.Lock()
 	defer svr.reloadMu.Unlock()
 
+	return svr.updateConfigSourceLocked(common, proxyCfgs, visitorCfgs)
+}
+
+// Caller must hold reloadMu.
+func (svr *Service) updateConfigSourceLocked(
+	common *v1.ClientCommonConfig,
+	proxyCfgs []v1.ProxyConfigurer,
+	visitorCfgs []v1.VisitorConfigurer,
+) error {
 	cfgSource := svr.configSource
 	if cfgSource == nil {
 		return fmt.Errorf("config source is not available")
@@ -412,8 +493,21 @@ func (svr *Service) Close() {
 }
 
 func (svr *Service) GracefulClose(d time.Duration) {
-	svr.gracefulShutdownDuration = d
-	svr.cancel(nil)
+	svr.gracefulShutdownDuration.Store(int64(d))
+	svr.lifecycleMu.Lock()
+	if svr.closed {
+		svr.lifecycleMu.Unlock()
+		return
+	}
+	svr.closed = true
+	cancel := svr.cancel
+	svr.lifecycleMu.Unlock()
+	if cancel != nil {
+		// Once Run has claimed startup, it also owns cleanup.
+		cancel(nil)
+	} else {
+		svr.stop()
+	}
 }
 
 func (svr *Service) stop() {
@@ -429,12 +523,17 @@ func (svr *Service) stop() {
 	svr.ctlMu.Lock()
 	defer svr.ctlMu.Unlock()
 	if svr.ctl != nil {
-		svr.ctl.GracefulClose(svr.gracefulShutdownDuration)
+		d := time.Duration(svr.gracefulShutdownDuration.Load())
+		svr.ctl.GracefulClose(d)
 		svr.ctl = nil
 	}
 	if svr.webServer != nil {
 		svr.webServer.Close()
 		svr.webServer = nil
+	}
+	if svr.metricsServer != nil {
+		svr.metricsServer.Close()
+		svr.metricsServer = nil
 	}
 	if svr.vnetController != nil {
 		_ = svr.vnetController.Stop()
@@ -506,9 +605,16 @@ func (svr *Service) reloadConfigFromSourcesLocked() error {
 	proxies, visitors = config.FilterClientConfigurers(reloadCommon, proxies, visitors)
 	proxies = config.CompleteProxyConfigurers(proxies)
 	visitors = config.CompleteVisitorConfigurers(visitors)
+	requirements := validation.GetClientConfigRequirements(reloadCommon, proxies, visitors)
+	if svr.vnetController == nil && requirements.VirtualNet {
+		return errors.New(
+			"VirtualNet-dependent configuration requires a VirtualNet runtime enabled at startup; " +
+				"restart frpc after configuring featureGates.VirtualNet and virtualNet.address",
+		)
+	}
 
 	// Atomically replace the entire configuration
-	if err := svr.UpdateAllConfigurer(proxies, visitors); err != nil {
+	if err := svr.updateAllConfigurerLocked(proxies, visitors); err != nil {
 		return err
 	}
 	return nil

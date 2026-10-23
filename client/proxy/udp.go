@@ -97,17 +97,28 @@ func (pxy *UDPProxy) InWorkConn(conn net.Conn, _ *msg.StartWorkConn) {
 		return
 	}
 
+	workConn := netpkg.WrapReadWriteCloserToConn(remote, conn)
+	// Plain UDP payload follows the configured wire protocol for message framing.
+	payloadRW, err := msg.NewUDPPacketReadWriter(workConn, pxy.clientCfg.Transport.WireProtocol, pxy.udpPacketCodec)
+	if err != nil {
+		xl.Errorf("create UDP packet read writer: %v", err)
+		workConn.Close()
+		return
+	}
+
 	pxy.mu.Lock()
-	pxy.workConn = netpkg.WrapReadWriteCloserToConn(remote, conn)
-	pxy.readCh = make(chan *msg.UDPPacket, 1024)
-	pxy.sendCh = make(chan msg.Message, 1024)
+	pxy.workConn = workConn
+	readCh := make(chan *msg.UDPPacket, 1024)
+	sendCh := make(chan msg.Message, 1024)
+	pxy.readCh = readCh
+	pxy.sendCh = sendCh
 	pxy.closed = false
 	pxy.mu.Unlock()
 
-	workConnReaderFn := func(conn net.Conn, readCh chan *msg.UDPPacket) {
+	workConnReaderFn := func(rw msg.ReadWriter, readCh chan *msg.UDPPacket) {
 		for {
 			var udpMsg msg.UDPPacket
-			if errRet := msg.ReadMsgInto(conn, &udpMsg); errRet != nil {
+			if errRet := rw.ReadMsgInto(&udpMsg); errRet != nil {
 				xl.Warnf("read from workConn for udp error: %v", errRet)
 				return
 			}
@@ -120,7 +131,7 @@ func (pxy *UDPProxy) InWorkConn(conn net.Conn, _ *msg.StartWorkConn) {
 			}
 		}
 	}
-	workConnSenderFn := func(conn net.Conn, sendCh chan msg.Message) {
+	workConnSenderFn := func(rw msg.ReadWriter, sendCh chan msg.Message) {
 		defer func() {
 			xl.Infof("writer goroutine for udp work connection closed")
 		}()
@@ -132,7 +143,7 @@ func (pxy *UDPProxy) InWorkConn(conn net.Conn, _ *msg.StartWorkConn) {
 			case *msg.Ping:
 				xl.Tracef("send ping message to udp workConn")
 			}
-			if errRet = msg.WriteMsg(conn, rawMsg); errRet != nil {
+			if errRet = rw.WriteMsg(rawMsg); errRet != nil {
 				xl.Errorf("udp work write error: %v", errRet)
 				return
 			}
@@ -151,10 +162,10 @@ func (pxy *UDPProxy) InWorkConn(conn net.Conn, _ *msg.StartWorkConn) {
 		}
 	}
 
-	go workConnSenderFn(pxy.workConn, pxy.sendCh)
-	go workConnReaderFn(pxy.workConn, pxy.readCh)
-	go heartbeatFn(pxy.sendCh)
+	go workConnSenderFn(payloadRW, sendCh)
+	go workConnReaderFn(payloadRW, readCh)
+	go heartbeatFn(sendCh)
 
 	// Call Forwarder with proxy protocol version (empty string means no proxy protocol)
-	udp.Forwarder(pxy.localAddr, pxy.readCh, pxy.sendCh, int(pxy.clientCfg.UDPPacketSize), pxy.cfg.Transport.ProxyProtocolVersion)
+	udp.Forwarder(pxy.localAddr, readCh, sendCh, int(pxy.clientCfg.UDPPacketSize), pxy.cfg.Transport.ProxyProtocolVersion)
 }
