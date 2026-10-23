@@ -19,12 +19,14 @@ package client
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -178,6 +180,42 @@ func TestMCPStdioRefusesServerRequests(t *testing.T) {
 	resp, err := p.dispatch(ctx, []byte(`{"jsonrpc":"2.0","id":0,"method":"tools/list"}`))
 	require.NoError(t, err)
 	require.JSONEq(t, `{"jsonrpc":"2.0","result":"ok","id":0}`, string(resp))
+}
+
+func TestMCPStdioTimeoutRepliesWithJSONRPCError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh stub")
+	}
+
+	saved := mcpStdioReadTimeout
+	mcpStdioReadTimeout = 200 * time.Millisecond
+	defer func() { mcpStdioReadTimeout = saved }()
+
+	dir := t.TempDir()
+	scriptPath := dir + "/silent.sh"
+	// A child that reads requests but never answers.
+	require.NoError(t, os.WriteFile(scriptPath, []byte("while IFS= read -r line; do :; done\n"), 0o600))
+
+	plugin, err := NewMCPStdioPlugin(PluginContext{}, &v1.MCPStdioPluginOptions{
+		Type:    v1.PluginMCPStdio,
+		Command: []string{"/bin/sh", scriptPath},
+	})
+	require.NoError(t, err)
+	defer plugin.Close()
+
+	p := plugin.(*MCPStdioPlugin)
+	resp, err := p.dispatch(context.Background(), []byte(`{"jsonrpc":"2.0","id":7,"method":"tools/call"}`))
+	require.NoError(t, err)
+
+	var got struct {
+		ID    int `json:"id"`
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(resp, &got))
+	require.Equal(t, 7, got.ID)
+	require.Equal(t, mcpStdioTimeoutCode, got.Error.Code)
 }
 
 func TestMCPStdioHTTPHandler(t *testing.T) {

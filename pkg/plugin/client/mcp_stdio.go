@@ -37,12 +37,26 @@ import (
 const (
 	// mcpStdioReapInterval is how often the worker checks for an idle child.
 	mcpStdioReapInterval = 30 * time.Second
-	// mcpStdioReadTimeout is the per-request deadline for a child response.
-	mcpStdioReadTimeout = 30 * time.Second
 	// mcpStdioMaxBodySize caps inbound HTTP request bodies to guard against
 	// memory exhaustion; JSON-RPC frames are small in practice.
 	mcpStdioMaxBodySize = 1 << 20 // 1 MiB
+	// mcpStdioTimeoutCode is the JSON-RPC error code for a request the child
+	// did not answer in time (the MCP SDKs' RequestTimeout code).
+	mcpStdioTimeoutCode = -32001
 )
+
+// mcpStdioReadTimeout is the per-request deadline for a child response. It
+// must stay above every child's own worst case, so a slow tool call fails
+// inside the child with its own error instead of tying with this deadline and
+// getting the child killed. A tie at 30s used to restart mcp-safari, whose new
+// auth token then locks the Safari extension out for ~24s. mcp-safari waits up
+// to 30s per extension call and caps run_steps at 60s, plus post-action waits.
+// It is a var so tests can shorten it.
+// Refactor: move to a per-proxy option like IdleTimeoutSeconds once a child
+// needs a materially different limit.
+var mcpStdioReadTimeout = 120 * time.Second
+
+var errMCPStdioChildTimeout = errors.New("child response timeout")
 
 func init() {
 	Register(v1.PluginMCPStdio, NewMCPStdioPlugin)
@@ -223,7 +237,7 @@ func (p *MCPStdioPlugin) worker() {
 		case r := <-ch:
 			return r.line, r.err
 		case <-time.After(mcpStdioReadTimeout):
-			return nil, errors.New("child response timeout")
+			return nil, errMCPStdioChildTimeout
 		case <-p.closeCh:
 			return nil, errors.New("plugin closing")
 		}
@@ -273,7 +287,7 @@ func (p *MCPStdioPlugin) worker() {
 				}
 				// otherwise a server notification/progress; discard and read next line
 			case <-deadline:
-				return nil, errors.New("child response timeout")
+				return nil, errMCPStdioChildTimeout
 			case <-p.closeCh:
 				return nil, errors.New("plugin closing")
 			}
@@ -427,6 +441,18 @@ func (p *MCPStdioPlugin) worker() {
 			line, err := readResponse(childOut, reqID)
 			if err != nil {
 				killChild()
+				if errors.Is(err, errMCPStdioChildTimeout) {
+					// Answer with a JSON-RPC error instead of a 502, so the caller
+					// sees why the call failed rather than a bare gateway error.
+					// Refactor: keep the child alive and drop its late response
+					// once a single reader goroutine per child owns stdout; today
+					// killing it is the only way to stop the pending read.
+					log.Warnf("mcp_stdio: %s: child response timeout after %s, child killed", p.opts.Command[0], mcpStdioReadTimeout)
+					if resp, mErr := timeoutErrorResponse(reqID); mErr == nil {
+						req.replyCh <- dispatchResp{data: resp}
+						continue
+					}
+				}
 				req.replyCh <- dispatchResp{err: fmt.Errorf("read stdout: %w", err)}
 				continue
 			}
@@ -473,6 +499,23 @@ func refuseServerRequest(id json.RawMessage, method string) ([]byte, error) {
 		"error": map[string]any{
 			"code":    -32601,
 			"message": method + " is not supported by the mcp_stdio bridge",
+		},
+	})
+}
+
+// timeoutErrorResponse builds the JSON-RPC error returned to the client for a
+// request the child did not answer within mcpStdioReadTimeout.
+func timeoutErrorResponse(reqID string) ([]byte, error) {
+	if reqID == "" {
+		reqID = "null"
+	}
+	return json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      json.RawMessage(reqID),
+		"error": map[string]any{
+			"code": mcpStdioTimeoutCode,
+			"message": fmt.Sprintf("no response from the MCP server within %s; the bridge restarted it. "+
+				"Retry with a smaller request.", mcpStdioReadTimeout),
 		},
 	})
 }
