@@ -409,3 +409,15 @@ func TestMCPStdioHTTPHandler(t *testing.T) {
 	require.True(t, bytes.Contains(w.Body.Bytes(), []byte(`"call=`)))
 	require.Equal(t, "application/json", w.Header().Get("Content-Type"))
 }
+
+func TestMCPStdioDescribeCall(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_note","arguments":{"id":"x"}}}`: "tools/call read_note",
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`:                                                      "tools/list",
+		`not json`: "",
+	} {
+		if got := describeCall([]byte(body)); got != want {
+			t.Errorf("describeCall(%s) = %q, want %q", body, got, want)
+		}
+	}
+}

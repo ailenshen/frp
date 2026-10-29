@@ -92,6 +92,9 @@ func init() {
 type MCPStdioPlugin struct {
 	opts    *v1.MCPStdioPluginOptions
 	idleTTL time.Duration
+	// name labels this child in the log: the proxy name, since several
+	// proxies can share one Command[0] (e.g. two servers both run via npx).
+	name string
 
 	l *Listener
 	s *http.Server
@@ -113,7 +116,7 @@ type dispatchResp struct {
 }
 
 // NewMCPStdioPlugin constructs the plugin from validated options.
-func NewMCPStdioPlugin(_ PluginContext, options v1.ClientPluginOptions) (Plugin, error) {
+func NewMCPStdioPlugin(pluginCtx PluginContext, options v1.ClientPluginOptions) (Plugin, error) {
 	opts := options.(*v1.MCPStdioPluginOptions)
 	if len(opts.Command) == 0 {
 		return nil, errors.New("mcp_stdio: command is required")
@@ -124,6 +127,7 @@ func NewMCPStdioPlugin(_ PluginContext, options v1.ClientPluginOptions) (Plugin,
 	p := &MCPStdioPlugin{
 		opts:       opts,
 		idleTTL:    time.Duration(opts.IdleTimeoutSeconds) * time.Second,
+		name:       pluginCtx.Name,
 		l:          listener,
 		reqCh:      make(chan dispatchReq),
 		closeCh:    make(chan struct{}),
@@ -221,9 +225,13 @@ func (p *MCPStdioPlugin) worker() {
 		replyCh  chan dispatchResp
 		sentAt   time.Time
 		isInit   bool
+		call     string // what was asked, for the timeout log: "tools/call read_note"
 	}
 
-	name := p.opts.Command[0]
+	name := p.name
+	if name == "" {
+		name = p.opts.Command[0]
+	}
 	var (
 		child      *exec.Cmd
 		childIn    io.WriteCloser
@@ -412,7 +420,7 @@ func (p *MCPStdioPlugin) worker() {
 				continue
 			}
 			delete(pending, id)
-			log.Warnf("mcp_stdio: %s: child response timeout after %s", name, mcpStdioReadTimeout)
+			log.Warnf("mcp_stdio: %s: child response timeout after %s (%s)", name, mcpStdioReadTimeout, pr.call)
 			pr.replyCh <- dispatchResp{data: errorResponse(pr.clientID, mcpStdioTimeoutCode, fmt.Sprintf(
 				"No response from the MCP server within %s. Do not repeat the same call; narrow it or try another approach.",
 				mcpStdioReadTimeout))}
@@ -517,6 +525,7 @@ func (p *MCPStdioPlugin) worker() {
 			replyCh:  req.replyCh,
 			sentAt:   time.Now(),
 			isInit:   isInit,
+			call:     describeCall(req.body),
 		}
 	}
 
@@ -663,6 +672,22 @@ func classifyJSONRPC(body []byte) (hasID bool, reqID string, isInit, isInitNote 
 	isInit = head.Method == "initialize"
 	isInitNote = head.Method == "notifications/initialized"
 	return
+}
+
+// describeCall names a request for the log: its method, plus the tool name
+// for "tools/call". Arguments are left out, since they can hold note text.
+func describeCall(body []byte) string {
+	var head struct {
+		Method string `json:"method"`
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	_ = json.Unmarshal(body, &head)
+	if head.Method == "tools/call" && head.Params.Name != "" {
+		return head.Method + " " + head.Params.Name
+	}
+	return head.Method
 }
 
 // refuseServerRequest builds the JSON-RPC "method not found" error sent back
