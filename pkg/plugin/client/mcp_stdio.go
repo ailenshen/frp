@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -96,8 +97,9 @@ type MCPStdioPlugin struct {
 	// proxies can share one Command[0] (e.g. two servers both run via npx).
 	name string
 
-	l *Listener
-	s *http.Server
+	l      *Listener
+	localL net.Listener
+	s      *http.Server
 
 	reqCh      chan dispatchReq
 	closeCh    chan struct{}
@@ -122,6 +124,15 @@ func NewMCPStdioPlugin(pluginCtx PluginContext, options v1.ClientPluginOptions) 
 		return nil, errors.New("mcp_stdio: command is required")
 	}
 
+	var localL net.Listener
+	if opts.LocalAddr != "" {
+		var err error
+		localL, err = net.Listen("tcp", opts.LocalAddr)
+		if err != nil {
+			return nil, fmt.Errorf("mcp_stdio: listen localAddr %s: %w", opts.LocalAddr, err)
+		}
+	}
+
 	listener := NewProxyListener()
 
 	p := &MCPStdioPlugin{
@@ -129,6 +140,7 @@ func NewMCPStdioPlugin(pluginCtx PluginContext, options v1.ClientPluginOptions) 
 		idleTTL:    time.Duration(opts.IdleTimeoutSeconds) * time.Second,
 		name:       pluginCtx.Name,
 		l:          listener,
+		localL:     localL,
 		reqCh:      make(chan dispatchReq),
 		closeCh:    make(chan struct{}),
 		workerDone: make(chan struct{}),
@@ -143,6 +155,10 @@ func NewMCPStdioPlugin(pluginCtx PluginContext, options v1.ClientPluginOptions) 
 	}
 
 	go func() { _ = p.s.Serve(listener) }()
+	if localL != nil {
+		log.Infof("mcp_stdio[%s]: listening locally on %s", p.name, localL.Addr())
+		go func() { _ = p.s.Serve(localL) }()
+	}
 	go p.worker()
 	return p, nil
 }
@@ -552,6 +568,13 @@ func (p *MCPStdioPlugin) worker() {
 		t := time.NewTicker(mcpStdioReapInterval)
 		defer t.Stop()
 		reaperCh = t.C
+	} else {
+		// Long-lived children (idleTimeoutSeconds = 0, e.g. mcp-safari) are
+		// spawned eagerly on plugin startup so external peers (like the Safari
+		// extension) can connect and authenticate before the first MCP tool call.
+		if err := ensureChild(); err != nil {
+			log.Warnf("mcp_stdio: %s: eager spawn failed: %v", name, err)
+		}
 	}
 
 	for {
@@ -783,6 +806,9 @@ func (p *MCPStdioPlugin) Name() string {
 func (p *MCPStdioPlugin) Close() error {
 	_ = p.s.Close()
 	_ = p.l.Close()
+	if p.localL != nil {
+		_ = p.localL.Close()
+	}
 	close(p.closeCh)
 	<-p.workerDone
 	return nil

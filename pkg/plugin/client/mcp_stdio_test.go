@@ -421,3 +421,48 @@ func TestMCPStdioDescribeCall(t *testing.T) {
 		}
 	}
 }
+
+func TestMCPStdioEagerStartAndLocalAddr(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses /bin/sh stub")
+	}
+
+	dir := t.TempDir()
+	marker := dir + "/started"
+	scriptPath := dir + "/eager.sh"
+	script := "touch " + marker + "\n" + fakeMCPScript
+	require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0o600))
+
+	plugin, err := NewMCPStdioPlugin(PluginContext{Name: "eager-test"}, &v1.MCPStdioPluginOptions{
+		Type:               v1.PluginMCPStdio,
+		Command:            []string{"/bin/sh", scriptPath},
+		IdleTimeoutSeconds: 0,
+		LocalAddr:          "127.0.0.1:0",
+	})
+	require.NoError(t, err)
+	defer plugin.Close()
+
+	// Eager start: child must spawn before any MCP request arrives.
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(marker)
+		return err == nil
+	}, 3*time.Second, 25*time.Millisecond, "idleTimeoutSeconds=0 child should start eagerly")
+
+	p := plugin.(*MCPStdioPlugin)
+	require.NotNil(t, p.localL)
+	url := "http://" + p.localL.Addr().String() + "/"
+
+	resp, err := http.Post(url, "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var body bytes.Buffer
+	_, err = body.ReadFrom(resp.Body)
+	require.NoError(t, err)
+	require.Contains(t, body.String(), `"call=1"`)
+
+	// A second request through dispatch shares the exact same warm child (call=2).
+	resp2, err := p.dispatch(context.Background(), []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`))
+	require.NoError(t, err)
+	require.Contains(t, string(resp2), `"call=2"`)
+}

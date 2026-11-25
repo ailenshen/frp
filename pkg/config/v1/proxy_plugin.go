@@ -252,6 +252,10 @@ type MCPStdioPluginOptions struct {
 	Command            []string          `json:"command,omitempty"`
 	Env                map[string]string `json:"env,omitempty"`
 	IdleTimeoutSeconds int               `json:"idleTimeoutSeconds,omitempty"`
+	// LocalAddr optionally exposes the same Streamable HTTP endpoint on a local
+	// TCP address (e.g. "127.0.0.1:3103") so local clients can share the warm
+	// child process directly without round-tripping through frps.
+	LocalAddr string `json:"localAddr,omitempty"`
 }
 
 func (o *MCPStdioPluginOptions) Complete() {}
